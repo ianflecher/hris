@@ -1,0 +1,3 @@
+*.sqlite*
+!seed/
+!seed/hris.sqlite

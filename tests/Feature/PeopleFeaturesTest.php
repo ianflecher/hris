@@ -1,0 +1,711 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Http\Controllers\PeopleController;
+use App\Models\User;
+use App\Services\PayrollRun;
+use App\Support\PayPeriod;
+use App\Support\PayrollCalculator;
+use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Tests\TestCase;
+
+class PeopleFeaturesTest extends TestCase
+{
+    use DatabaseTransactions;
+
+    private User $hr;
+    private User $staff;
+    private User $other;
+    private int $employeeId;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->hr = $this->user('admin');
+        $this->staff = $this->user('employee');
+        $this->other = $this->user('employee');
+        $this->employeeId = (int) DB::table('employees')->where('user_id', $this->staff->user_id)->value('employee_id');
+    }
+
+    private function user(string $role): User
+    {
+        $token = bin2hex(random_bytes(6));
+        $user = User::create(['full_name' => 'Feature '.$token, 'username' => 'feature'.$token,
+            'email' => $token.'@example.test', 'password' => 'Password123!', 'role' => $role]);
+        DB::table('employees')->insert(['user_id' => $user->user_id, 'job_title' => 'Tester', 'hire_date' => '2018-01-01', 'salary' => 22000,
+            'status' => 'active', 'shift_start' => '08:00:00', 'created_at' => now(), 'updated_at' => now()]);
+        return $user;
+    }
+
+    /**
+     * A clean day worked for every date in the range, so a test about something
+     * else is not swamped by absence deductions.
+     */
+    private function attend(int $employeeId, string $from, string $to): void
+    {
+        for ($day = \Carbon\Carbon::parse($from); $day->lte(\Carbon\Carbon::parse($to)); $day->addDay()) {
+            DB::table('hr_attendance')->updateOrInsert(
+                ['employee_id' => $employeeId, 'date' => $day->toDateString()],
+                ['time_in' => $day->toDateString().' 08:00:00', 'time_out' => $day->toDateString().' 17:00:00',
+                 'status' => 'present', 'created_at' => now(), 'updated_at' => now()]);
+        }
+    }
+
+    public function test_all_feature_pages_render_for_the_correct_portal(): void
+    {
+        foreach (PeopleController::MODULES as $module => $label) {
+            $this->actingAs($this->hr)->get('/hr/people/'.$module)->assertOk()->assertSee($label);
+            $this->actingAs($this->staff)->get('/employee/people/'.$module)->assertOk();
+        }
+    }
+
+    public function test_employees_cannot_access_hr_pages(): void
+    {
+        foreach (array_keys(PeopleController::MODULES) as $module) {
+            $this->actingAs($this->staff)->get('/hr/people/'.$module)->assertForbidden();
+        }
+    }
+
+    public function test_documents_are_private_and_expiry_alerts_render(): void
+    {
+        Storage::fake('local');
+        $this->actingAs($this->hr)->post('/hr/people/documents', ['employee_id' => $this->employeeId,
+            'title' => 'Employment contract', 'category' => 'contract', 'expires_on' => today()->addDays(5)->toDateString(),
+            'document' => UploadedFile::fake()->create('contract.pdf', 10, 'application/pdf')])->assertRedirect()->assertSessionHasNoErrors();
+        $doc = DB::table('employee_documents')->where('employee_id', $this->employeeId)->first();
+        $this->assertNotNull($doc);
+        Storage::disk('local')->assertExists($doc->path);
+        $this->actingAs($this->staff)->get('/people/documents/'.$doc->id.'/download')->assertOk();
+        $this->get('/employee/people/documents?expiring=1')->assertOk()->assertSee('Employment contract');
+        $this->actingAs($this->other)->get('/people/documents/'.$doc->id.'/download')->assertForbidden();
+        $this->get('/employee/people/documents')->assertDontSee('Employment contract');
+        $this->post('/employee/people/documents/'.$doc->id, ['action' => 'delete'])->assertForbidden();
+    }
+
+    public function test_an_employee_uploads_their_own_document(): void
+    {
+        Storage::fake('local');
+
+        $this->actingAs($this->staff)->post('/employee/people/documents', [
+            'title' => 'My NBI clearance', 'category' => 'id',
+            'document' => UploadedFile::fake()->create('nbi.pdf', 10, 'application/pdf'),
+        ])->assertRedirect()->assertSessionHasNoErrors();
+
+        // Filed against them, not against whoever they might have named.
+        $this->assertDatabaseHas('employee_documents', ['employee_id' => $this->employeeId, 'title' => 'My NBI clearance']);
+    }
+
+    public function test_application_documents_land_in_the_vault_when_somebody_is_hired(): void
+    {
+        Storage::fake('public');
+        Storage::fake('local');
+
+        $applicant = User::create(['full_name' => 'Applicant '.bin2hex(random_bytes(4)), 'username' => 'appl'.bin2hex(random_bytes(4)),
+            'email' => bin2hex(random_bytes(4)).'@example.test', 'password' => 'Password123!', 'role' => 'employee']);
+
+        $applicationId = DB::table('job_applications')->insertGetId(['user_id' => $applicant->user_id,
+            'position_applied' => 'Screen Printing Operator', 'years_experience' => 2, 'status' => 'pending',
+            'application_date' => today()->toDateString(), 'created_at' => now(), 'updated_at' => now()]);
+
+        Storage::disk('public')->put('application_documents/1/resume.pdf', 'their resume');
+        DB::table('application_documents')->insert(['application_id' => $applicationId, 'user_id' => $applicant->user_id,
+            'filename' => 'resume.pdf', 'filepath' => 'application_documents/1/resume.pdf', 'filetype' => 'application/pdf',
+            'filesize' => 12, 'uploaded_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+
+        $employeeId = DB::table('employees')->insertGetId(['user_id' => $applicant->user_id, 'job_title' => 'Hired',
+            'hire_date' => today()->toDateString(), 'status' => 'active', 'created_at' => now(), 'updated_at' => now()]);
+
+        $carried = (new \App\Services\DocumentVault)->adoptApplicationDocuments($applicant->user_id, $employeeId);
+
+        $this->assertSame(1, $carried);
+        $document = DB::table('employee_documents')->where('employee_id', $employeeId)->first();
+        $this->assertSame('resume.pdf', $document->original_name);
+        Storage::disk('local')->assertExists($document->path);
+
+        // Running it again must not file the same document twice.
+        $this->assertSame(0, (new \App\Services\DocumentVault)->adoptApplicationDocuments($applicant->user_id, $employeeId));
+        $this->assertSame(1, DB::table('employee_documents')->where('employee_id', $employeeId)->count());
+    }
+
+    private function overtime(): int
+    {
+        $this->actingAs($this->staff)->post('/employee/people/overtime', ['employee_id' => 999999,
+            'starts_at' => '2018-01-02T18:00', 'ends_at' => '2018-01-02T20:00', 'reason' => 'Complete the print run'])->assertRedirect()->assertSessionHasNoErrors();
+        return (int) DB::table('overtime_requests')->where('employee_id', $this->employeeId)->value('id');
+    }
+
+    private function assignSupervisor(User $supervisor): int
+    {
+        $department = DB::table('departments')->insertGetId([
+            'department_name' => 'Test team '.bin2hex(random_bytes(3)),
+            'supervisor_id' => $supervisor->user_id,
+        ]);
+        DB::table('employees')->where('employee_id', $this->employeeId)->update(['department_id' => $department]);
+
+        return $department;
+    }
+
+    public function test_a_supervisor_sets_the_team_schedule_on_the_grid(): void
+    {
+        $supervisor = $this->user('supervisor');
+        $this->assignSupervisor($supervisor);
+        $cutoff = \App\Support\PayPeriod::fromStart(now()->toDateString());
+        $day = $cutoff->start;
+        $this->actingAs($supervisor)->get('/employee/people/shifts?grid='.$cutoff->start)->assertOk()->assertSee('Team schedule')
+            ->assertSee('cells['.$this->employeeId.']['.$day.']', false);
+        $this->post('/employee/people/shifts', ['kind' => 'schedule-grid', 'cutoff' => $cutoff->start,
+            'cells' => [$this->employeeId => [$day => '10-7', \Carbon\Carbon::parse($day)->addDay()->toDateString() => 'RD']]])->assertRedirect();
+        $this->assertDatabaseHas('shift_assignments', ['employee_id' => $this->employeeId, 'work_date' => $day, 'starts_at' => '10:00:00', 'ends_at' => '19:00:00', 'rest_day' => 0]);
+        $this->assertDatabaseHas('shift_assignments', ['employee_id' => $this->employeeId, 'work_date' => \Carbon\Carbon::parse($day)->addDay()->toDateString(), 'rest_day' => 1]);
+        $this->post('/employee/people/shifts', ['kind' => 'schedule-grid', 'cutoff' => $cutoff->start,
+            'cells' => [$this->employeeId => [$day => 'LEAVE']]])->assertSessionHasErrors('cells');
+        // A suspension is the supervisor's to set, and to take back.
+        $this->post('/employee/people/shifts', ['kind' => 'schedule-grid', 'cutoff' => $cutoff->start,
+            'cells' => [$this->employeeId => [$day => 'S']]])->assertRedirect();
+        $this->assertDatabaseHas('hr_attendance', ['employee_id' => $this->employeeId, 'date' => $day, 'notes' => 'Suspension']);
+        $this->post('/employee/people/shifts', ['kind' => 'schedule-grid', 'cutoff' => $cutoff->start,
+            'cells' => [$this->employeeId => [$day => '8-5']]])->assertRedirect();
+        $this->assertDatabaseMissing('hr_attendance', ['employee_id' => $this->employeeId, 'date' => $day, 'notes' => 'Suspension']);
+        $this->post('/employee/people/shifts', ['kind' => 'schedule-grid', 'cutoff' => $cutoff->start,
+            'cells' => [(int) DB::table('employees')->where('user_id', $this->other->user_id)->value('employee_id') => [$day => '8-5']]])->assertForbidden();
+        DB::table('shift_assignments')->where('employee_id', $this->employeeId)->delete();
+    }
+    public function test_overtime_ownership_overlap_approval_and_display(): void
+    {
+        $id = $this->overtime();
+        $this->assertDatabaseHas('overtime_requests', ['id' => $id, 'employee_id' => $this->employeeId, 'minutes' => 120]);
+        $this->post('/employee/people/overtime', ['starts_at' => '2018-01-02T19:00', 'ends_at' => '2018-01-02T21:00', 'reason' => 'Overlapping request'])->assertSessionHasErrors('starts_at');
+        $this->post('/employee/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertForbidden();
+        // HR only sees overtime: the supervisor approves, then Ma'am An.
+        $this->actingAs($this->hr)->post('/hr/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertForbidden();
+        $supervisor = $this->user('supervisor');
+        $this->assignSupervisor($supervisor);
+        $this->actingAs($supervisor)->post('/employee/people/overtime/'.$id, ['action' => 'approve'])->assertRedirect();
+        $this->assertDatabaseHas('overtime_requests', ['id' => $id, 'status' => 'pending_hr', 'manager_reviewed_by' => $supervisor->user_id]);
+        $this->actingAs($this->hr)->post('/hr/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertForbidden();
+        $final = $this->user('supervisor');
+        config(['leave.supervisor_approver_user_id' => $final->user_id]);
+        $this->actingAs($final)->post('/employee/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertRedirect();
+        $this->assertDatabaseHas('overtime_requests', ['id' => $id, 'status' => 'approved', 'approved_amount' => 300, 'reviewed_by' => $final->user_id]);
+        $this->actingAs($this->hr)->get('/hr/people/overtime')->assertOk()->assertSee('300.00');
+        $this->actingAs($final)->post('/employee/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 500])->assertForbidden();
+    }
+
+    public function test_supervisors_can_only_review_their_assigned_department(): void
+    {
+        $id = $this->overtime();
+        $supervisor = $this->user('supervisor');
+        $this->actingAs($supervisor)->post('/employee/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertForbidden();
+        $this->assignSupervisor($supervisor);
+        $this->post('/employee/people/overtime/'.$id, ['action' => 'approve', 'approved_amount' => 300])->assertRedirect();
+        $this->assertDatabaseHas('overtime_requests', ['id' => $id, 'status' => 'pending_hr', 'manager_reviewed_by' => $supervisor->user_id]);
+    }
+
+    public function test_the_calendar_draws_itself_from_the_employee_and_the_holidays(): void
+    {
+        // Sunday off, no assignment entered anywhere.
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => '7']);
+
+        // 2018-01-07 was a Sunday, 2018-01-08 a Monday.
+        $this->actingAs($this->staff)->get('/employee/people/shifts?month=2018-01')
+            ->assertOk()->assertSee('08:00')->assertSee('Rest day')->assertSee('Sunday')->assertSee('RD');
+
+        // The holiday is the only thing HR enters, and it covers everybody.
+        $this->actingAs($this->hr)->post('/hr/people/shifts',
+            ['date' => '2018-01-08', 'name' => 'Founding Day', 'type' => 'special'])->assertRedirect()->assertSessionHasNoErrors();
+        $this->get('/hr/people/shifts?month=2018-01')->assertOk()->assertSee('Founding Day');
+        $this->actingAs($this->staff)->get('/employee/people/shifts?month=2018-01')->assertOk()->assertSee('Founding Day');
+
+        // Entering the same date again replaces it rather than colliding.
+        $this->actingAs($this->hr)->post('/hr/people/shifts',
+            ['date' => '2018-01-08', 'name' => 'Founding Day (moved)', 'type' => 'regular'])->assertRedirect()->assertSessionHasNoErrors();
+        $this->assertSame(1, DB::table('holidays')->where('date', '2018-01-08')->count());
+
+        // An employee can neither add nor remove one.
+        $id = DB::table('holidays')->where('date', '2018-01-08')->value('id');
+        $this->actingAs($this->staff)->post('/employee/people/shifts', ['date' => '2018-01-09', 'name' => 'Mine', 'type' => 'regular'])->assertForbidden();
+        $this->post('/employee/people/shifts/'.$id, ['action' => 'delete'])->assertForbidden();
+
+        $this->actingAs($this->hr)->post('/hr/people/shifts/'.$id, ['action' => 'delete'])->assertRedirect();
+        $this->assertDatabaseMissing('holidays', ['id' => $id]);
+    }
+
+    public function test_leaving_early_is_deducted_and_named_on_the_payslip(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => null, 'salary' => 22000]);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+
+        // On time in, left before completing an eight-hour duty.
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-03')
+            ->update(['time_out' => '2018-01-03 15:30:00']);
+
+        // A day with no clock-out is worked but incomplete, so it is undertime.
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-04')
+            ->update(['time_out' => null]);
+
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $payslip = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->first();
+
+        $day = round(22000 / 22, 2);
+        $this->assertStringContainsString('Undertime (2 days)', $payslip->notes);
+        $this->assertStringContainsString(number_format($day, 2), $payslip->notes);
+        $this->assertStringNotContainsString('Late', $payslip->notes);
+    }
+
+    public function test_schedule_still_wins_when_the_employee_completed_eight_hours(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => null, 'salary' => 22000]);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-03')
+            ->update(['time_in' => '2018-01-03 07:30:00', 'time_out' => '2018-01-03 15:30:00']);
+
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $payslip = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->first();
+
+        $this->assertStringContainsString('Undertime', $payslip->notes ?? '');
+        $this->assertStringNotContainsString('Late', $payslip->notes ?? '');
+    }
+
+    public function test_guard_is_late_when_the_schedule_was_six_to_six_but_they_worked_seven_to_seven(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['job_title' => 'Security Guard', 'shift_start' => '06:00:00', 'shift_end' => '18:00:00',
+                'rest_days' => null, 'salary' => 22000]);
+
+        for ($day = \Carbon\Carbon::parse('2018-01-01'); $day->lte(\Carbon\Carbon::parse('2018-01-15')); $day->addDay()) {
+            DB::table('hr_attendance')->updateOrInsert(
+                ['employee_id' => $this->employeeId, 'date' => $day->toDateString()],
+                ['time_in' => $day->toDateString().' 06:00:00', 'time_out' => $day->toDateString().' 18:00:00',
+                    'status' => 'present', 'created_at' => now(), 'updated_at' => now()]
+            );
+        }
+
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-03')
+            ->update(['time_in' => '2018-01-03 07:00:00', 'time_out' => '2018-01-03 19:00:00']);
+
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $payslip = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->first();
+
+        $this->assertStringContainsString('Late (1 day)', $payslip->notes ?? '');
+    }
+
+    public function test_a_four_hour_half_day_counts_as_paid_work_time(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => null, 'salary' => 22000]);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-03')
+            ->update(['time_in' => '2018-01-03 08:00:00', 'time_out' => '2018-01-03 13:00:00']);
+
+        $employee = DB::table('employees')->where('employee_id', $this->employeeId)->first();
+        $work = app(\App\Services\WorkTimePayroll::class)->forPeriod($employee, '2018-01-01', '2018-01-15');
+
+        // The 8-1 day is a four-hour half day now, and paid.
+        $this->assertSame(116.0, $work['hours']);
+    }
+
+    public function test_late_and_undertime_on_one_day_cost_one_day(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => null, 'salary' => 22000]);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+
+        // An hour late and an hour early: half a day each.
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-03')
+            ->update(['time_in' => '2018-01-03 09:00:00', 'time_out' => '2018-01-03 16:00:00', 'status' => 'late']);
+
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $payslip = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->first();
+
+        $half = round(22000 / 22 / 2, 2);
+        $this->assertStringContainsString('Late (1 day): PHP '.number_format($half, 2), $payslip->notes);
+        $this->assertStringContainsString('Undertime (1 day): PHP '.number_format($half, 2), $payslip->notes);
+
+        // The two together are one whole day off the gross, and no more.
+        $expected = PayrollCalculator::forCutoff(22000, round(22000 / 22, 2), false);
+        $this->assertEquals($expected['net'], (float) $payslip->net_pay);
+    }
+
+    private function payslip(string $start = '2018-01-01'): object
+    {
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart($start));
+
+        return DB::table('hr_payroll')->where('employee_id', $this->employeeId)->where('period_start', $start)->first();
+    }
+
+    public function test_a_day_missed_costs_the_day(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->whereIn('date', ['2018-01-04', '2018-01-05'])->delete();
+
+        $payslip = $this->payslip();
+
+        $day = round(22000 / 22, 2);
+        $this->assertStringContainsString('Absent (2 days): PHP '.number_format($day * 2, 2), $payslip->notes);
+
+        $expected = PayrollCalculator::forCutoff(22000, round($day * 2, 2), false);
+        $this->assertEquals($expected['net'], (float) $payslip->net_pay);
+    }
+
+    public function test_a_day_marked_absent_counts_the_same_as_no_record(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-04')
+            ->update(['time_in' => null, 'time_out' => null, 'status' => 'absent']);
+
+        $this->assertStringContainsString('Absent (1 day)', $this->payslip()->notes);
+    }
+
+    public function test_approved_leave_is_paid_and_not_counted_absent(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->whereIn('date', ['2018-01-04', '2018-01-05'])->delete();
+
+        DB::table('leaves')->insert(['employee_id' => $this->employeeId, 'leave_type' => 'vacation',
+            'start_date' => '2018-01-04', 'end_date' => '2018-01-05', 'total_days' => 2, 'reason' => 'Family matters',
+            'status' => 'approved', 'created_at' => now(), 'updated_at' => now()]);
+
+        $payslip = $this->payslip();
+
+        $this->assertStringNotContainsString('Absent', $payslip->notes);
+        $this->assertStringContainsString('Paid leave: 2 days', $payslip->notes);
+
+        // Nothing at all comes off for those days.
+        $expected = PayrollCalculator::forCutoff(22000, 0.0, false);
+        $this->assertEquals($expected['net'], (float) $payslip->net_pay);
+    }
+
+    public function test_leave_that_is_only_requested_does_not_excuse_the_day(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-04')->delete();
+
+        DB::table('leaves')->insert(['employee_id' => $this->employeeId, 'leave_type' => 'vacation',
+            'start_date' => '2018-01-04', 'end_date' => '2018-01-04', 'total_days' => 1, 'reason' => 'Asked for',
+            'status' => 'pending', 'created_at' => now(), 'updated_at' => now()]);
+
+        $this->assertStringContainsString('Absent (1 day)', $this->payslip()->notes,
+            'a pending request is not a day off yet, or approving it would mean nothing');
+    }
+
+    public function test_unpaid_leave_costs_the_day_but_is_named_as_leave(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-04')->delete();
+
+        DB::table('leaves')->insert(['employee_id' => $this->employeeId, 'leave_type' => 'unpaid',
+            'start_date' => '2018-01-04', 'end_date' => '2018-01-04', 'total_days' => 1, 'reason' => 'Personal',
+            'status' => 'approved', 'created_at' => now(), 'updated_at' => now()]);
+
+        $notes = $this->payslip()->notes;
+
+        $this->assertStringContainsString('Unpaid leave (1 day)', $notes);
+        $this->assertStringNotContainsString('Absent', $notes);
+    }
+
+    public function test_rest_days_holidays_and_days_before_hiring_are_never_absences(): void
+    {
+        // Sundays off, hired on the 8th, and the 10th is a holiday.
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => '7', 'salary' => 22000, 'hire_date' => '2018-01-08']);
+        DB::table('holidays')->insert(['date' => '2018-01-10', 'name' => 'Founding Day', 'type' => 'regular',
+            'created_at' => now(), 'updated_at' => now()]);
+
+        $this->attend($this->employeeId, '2018-01-08', '2018-01-15');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-01-10')->delete();
+
+        $payslip = $this->payslip();
+
+        // The 1st to the 7th predate the hire, the 7th and 14th are Sundays,
+        // and the 10th is the holiday - none of them are missed days.
+        $this->assertStringNotContainsString('Absent', $payslip->notes);
+    }
+
+    public function test_the_rest_of_the_cutoff_is_not_charged_before_it_happens(): void
+    {
+        // A cutoff running now: the days still to come cannot be absences.
+        $period = PayPeriod::recent(1)[0];
+
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => null, 'salary' => 22000, 'hire_date' => '2017-01-01']);
+        $this->attend($this->employeeId, $period->start, today()->toDateString());
+
+        (new PayrollRun)->generate($this->employeeId, $period);
+        $payslip = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->where('period_start', $period->start)->first();
+
+        $this->assertStringNotContainsString('Absent', $payslip->notes ?? '');
+
+        DB::table('hr_payroll')->where('payroll_id', $payslip->payroll_id)->delete();
+    }
+
+    public function test_nobody_is_late_on_a_rest_day_or_a_holiday(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'rest_days' => '7', 'salary' => 22000]);
+        DB::table('holidays')->insert(['date' => '2018-01-08', 'name' => 'Founding Day', 'type' => 'regular', 'created_at' => now(), 'updated_at' => now()]);
+
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-15');
+
+        foreach (['2018-01-07', '2018-01-08'] as $date) {
+            DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', $date)
+                ->update(['time_in' => $date.' 10:30:00', 'status' => 'late']);
+        }
+
+        (new PayrollRun)->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $notes = DB::table('hr_payroll')->where('employee_id', $this->employeeId)->value('notes');
+
+        // Two and a half hours late on each - but neither was a day they were due.
+        $this->assertStringNotContainsString('Late', $notes);
+    }
+
+    public function test_the_checklist_screen_lists_the_people_who_need_one(): void
+    {
+        // Hired in 2018 and still here: settled, so not on the list by default.
+        $this->actingAs($this->hr)->get('/hr/people/checklists')->assertOk()->assertDontSee($this->staff->full_name);
+        // Reachable, rather than on the first page of it: with a real roster
+        // "Show everyone" is many pages long, and this test is about whether
+        // the person can be found at all.
+        $this->get('/hr/people/checklists?all=1&search='.urlencode($this->staff->full_name))
+            ->assertOk()->assertSee($this->staff->full_name);
+
+        // A new starter appears without anybody having to start anything...
+        DB::table('employees')->where('employee_id', $this->employeeId)->update(['hire_date' => today()->subDays(3)->toDateString()]);
+        $this->get('/hr/people/checklists')->assertOk()->assertSee($this->staff->full_name)->assertSee("No onboarding checklist");
+
+        // ...and stays while the checklist is open, whatever their hire date.
+        $this->post('/hr/people/checklists', ['employee_id' => $this->employeeId, 'type' => 'onboarding', 'due_on' => '2018-02-01'])->assertRedirect();
+        DB::table('employees')->where('employee_id', $this->employeeId)->update(['hire_date' => '2018-01-01']);
+        $this->get('/hr/people/checklists')->assertOk()->assertSee('Complete orientation');
+
+        // Once it is finished they drop off again.
+        foreach (DB::table('checklist_items')->where('checklist_id', DB::table('employee_checklists')->where('employee_id', $this->employeeId)->value('id'))->pluck('id') as $itemId) {
+            $id = DB::table('employee_checklists')->where('employee_id', $this->employeeId)->value('id');
+            $this->post('/hr/people/checklists/'.$id, ['action' => 'toggle', 'item_id' => $itemId])->assertRedirect();
+        }
+        $this->post('/hr/people/checklists/'.DB::table('employee_checklists')->where('employee_id', $this->employeeId)->value('id'), ['action' => 'complete'])->assertRedirect();
+        $this->get('/hr/people/checklists')->assertOk()->assertDontSee($this->staff->full_name);
+
+        // Somebody who has left needs clearing, so they come back.
+        DB::table('employees')->where('employee_id', $this->employeeId)->update(['status' => 'terminated']);
+        $this->get('/hr/people/checklists')->assertOk()->assertSee($this->staff->full_name)->assertSee('has left and has not been cleared');
+    }
+
+    public function test_checklists_enforce_task_owner_and_completion_gate(): void
+    {
+        $this->actingAs($this->hr)->post('/hr/people/checklists', ['employee_id' => $this->employeeId, 'type' => 'offboarding', 'due_on' => '2018-02-01'])->assertRedirect();
+        $id = DB::table('employee_checklists')->where('employee_id', $this->employeeId)->value('id');
+        $this->post('/hr/people/checklists/'.$id, ['action' => 'complete'])->assertStatus(422);
+        $item = DB::table('checklist_items')->where('checklist_id', $id)->where('owner', 'hr')->first();
+        $this->actingAs($this->staff)->post('/employee/people/checklists/'.$id, ['action' => 'toggle', 'item_id' => $item->id])->assertForbidden();
+        $this->actingAs($this->hr)->get('/hr/people/checklists')->assertOk()->assertSee('Return company equipment');
+        foreach (DB::table('checklist_items')->where('checklist_id', $id)->pluck('id') as $itemId) {
+            $this->post('/hr/people/checklists/'.$id, ['action' => 'toggle', 'item_id' => $itemId])->assertRedirect();
+        }
+        $this->post('/hr/people/checklists/'.$id, ['action' => 'complete'])->assertRedirect();
+        $this->assertNotNull(DB::table('employee_checklists')->where('id', $id)->value('completed_at'));
+    }
+
+    public function test_a_notice_to_explain_is_answered_before_it_is_decided(): void
+    {
+        $this->actingAs($this->hr)->post('/hr/people/reviews', ['employee_id' => $this->employeeId,
+            'period_start' => '2018-01-01', 'period_end' => '2018-03-31', 'due_on' => '2018-04-15'])->assertRedirect();
+        $review = DB::table('performance_reviews')->where('employee_id', $this->employeeId)->value('id');
+
+        $this->post('/hr/people/reviews/'.$review, ['action' => 'notice',
+            'occurred_on' => '2018-02-05', 'type' => 'lateness',
+            'allegation' => 'Late on eleven days in February. Please explain.',
+            'respond_by' => today()->addDays(5)->toDateString()])->assertRedirect()->assertSessionHasNoErrors();
+
+        $notice = DB::table('employee_notices')->where('employee_id', $this->employeeId)->first();
+        $this->assertSame('issued', $notice->status);
+
+        // A decision before they have answered is the thing the rule exists to
+        // prevent, and the deadline has not passed.
+        $this->post('/people/notices/'.$notice->id, ['action' => 'decide',
+            'decision' => 'written', 'decision_notes' => 'Deciding without hearing them.'])->assertStatus(422);
+
+        // The employee answers it, and nobody else can answer for them.
+        $this->actingAs($this->other)->post('/people/notices/'.$notice->id,
+            ['action' => 'explain', 'explanation' => 'Not my notice to answer.'])->assertForbidden();
+
+        $this->actingAs($this->staff)->post('/people/notices/'.$notice->id,
+            ['action' => 'explain', 'explanation' => 'The service jeepney route was closed for roadworks.'])
+            ->assertRedirect()->assertSessionHasNoErrors();
+
+        $this->assertSame('explained', DB::table('employee_notices')->where('id', $notice->id)->value('status'));
+
+        // ...once.
+        $this->post('/people/notices/'.$notice->id,
+            ['action' => 'explain', 'explanation' => 'Changing my answer afterwards.'])->assertStatus(422);
+
+        // Now HR can decide, and the employee sees it.
+        $this->actingAs($this->hr)->post('/people/notices/'.$notice->id, ['action' => 'decide',
+            'decision' => 'verbal', 'decision_notes' => 'Explained. Verbal warning recorded.'])->assertRedirect();
+
+        $closed = DB::table('employee_notices')->where('id', $notice->id)->first();
+        $this->assertSame('closed', $closed->status);
+        $this->assertSame($this->hr->user_id, $closed->decided_by);
+    }
+
+    public function test_a_termination_notice_can_only_follow_one_that_was_heard(): void
+    {
+        $this->actingAs($this->hr)->post('/hr/people/reviews', ['employee_id' => $this->employeeId,
+            'period_start' => '2018-01-01', 'period_end' => '2018-03-31', 'due_on' => '2018-04-15'])->assertRedirect();
+        $review = DB::table('performance_reviews')->where('employee_id', $this->employeeId)->value('id');
+
+        $this->post('/hr/people/reviews/'.$review, ['action' => 'notice',
+            'occurred_on' => '2018-02-05', 'type' => 'conduct',
+            'allegation' => 'Please explain the incident on the floor that day.',
+            'respond_by' => today()->addDays(5)->toDateString()])->assertRedirect();
+        $notice = DB::table('employee_notices')->where('employee_id', $this->employeeId)->first();
+
+        // Not before they have answered and it has been decided.
+        $this->post('/people/notices/'.$notice->id, ['action' => 'terminate',
+            'effective_on' => today()->addDays(30)->toDateString(),
+            'allegation' => 'Ending employment without hearing them.'])->assertStatus(422);
+
+        $this->actingAs($this->staff)->post('/people/notices/'.$notice->id,
+            ['action' => 'explain', 'explanation' => 'My account of what happened that day.'])->assertRedirect();
+
+        // Decided as a warning: still no termination notice to be had.
+        $this->actingAs($this->hr)->post('/people/notices/'.$notice->id, ['action' => 'decide',
+            'decision' => 'written', 'decision_notes' => 'Written warning recorded.'])->assertRedirect();
+
+        $this->post('/people/notices/'.$notice->id, ['action' => 'terminate',
+            'effective_on' => today()->addDays(30)->toDateString(),
+            'allegation' => 'Not what was decided.'])->assertStatus(422);
+
+        // Decided as termination, and now it can be issued - once.
+        DB::table('employee_notices')->where('id', $notice->id)->update(['decision' => 'termination']);
+
+        $this->post('/people/notices/'.$notice->id, ['action' => 'terminate',
+            'effective_on' => today()->addDays(30)->toDateString(),
+            'allegation' => 'Employment ends following the decision of this case.'])
+            ->assertRedirect()->assertSessionHasNoErrors();
+
+        $termination = DB::table('employee_notices')->where('kind', 'not')->where('parent_id', $notice->id)->first();
+        $this->assertNotNull($termination);
+        $this->assertSame('terminated', DB::table('employees')->where('employee_id', $this->employeeId)->value('status'));
+
+        $this->post('/people/notices/'.$notice->id, ['action' => 'terminate',
+            'effective_on' => today()->addDays(60)->toDateString(),
+            'allegation' => 'Issuing it twice.'])->assertStatus(422);
+
+        // The employee is told, on their own screen.
+        $this->actingAs($this->staff)->get('/employee/people/reviews')->assertOk()
+            ->assertSee('Notice of Termination')
+            ->assertSee('Employment ends following the decision of this case.');
+    }
+
+    public function test_an_employee_sees_the_evaluation_but_not_the_draft(): void
+    {
+        $this->actingAs($this->hr)->post('/hr/people/reviews', ['employee_id' => $this->employeeId,
+            'period_start' => '2018-01-01', 'period_end' => '2018-03-31', 'due_on' => '2018-04-15'])->assertRedirect();
+        $review = DB::table('performance_reviews')->where('employee_id', $this->employeeId)->value('id');
+
+        // While it is being written it is HR's.
+        $this->actingAs($this->staff)->get('/employee/people/reviews')->assertOk()
+            ->assertSee('no completed reviews yet');
+
+        $this->actingAs($this->hr)->post('/hr/people/reviews/'.$review, ['action' => 'finalize',
+            'rating' => 4, 'feedback' => 'Good year overall, watch the timekeeping.'])->assertRedirect();
+
+        $this->actingAs($this->staff)->get('/employee/people/reviews')->assertOk()
+            ->assertSee('Very good')
+            ->assertSee('Good year overall, watch the timekeeping.');
+
+        // And it is locked.
+        $this->actingAs($this->hr)->post('/hr/people/reviews/'.$review, ['action' => 'finalize',
+            'rating' => 1, 'feedback' => 'Changing my mind after the fact.'])->assertStatus(422);
+    }
+
+    public function test_the_review_reads_the_attendance_record_rather_than_asking(): void
+    {
+        DB::table('employees')->where('employee_id', $this->employeeId)
+            ->update(['shift_start' => '08:00:00', 'shift_end' => '17:00:00', 'rest_days' => null, 'hire_date' => '2017-01-01']);
+
+        $this->attend($this->employeeId, '2018-02-01', '2018-02-28');
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-02-05')
+            ->update(['time_in' => '2018-02-05 09:30:00', 'status' => 'late']);
+        DB::table('hr_attendance')->where('employee_id', $this->employeeId)->where('date', '2018-02-06')->delete();
+
+        $summary = (new \App\Services\ReviewSummary)->attendance(
+            DB::table('employees')->where('employee_id', $this->employeeId)->first(), '2018-02-01', '2018-02-28');
+
+        $this->assertSame(1, $summary['late']);
+        $this->assertSame(1, $summary['absent']);
+        $this->assertGreaterThan(20, $summary['days']);
+    }
+
+    public function test_hr_cannot_raise_a_loan_on_somebodys_behalf(): void
+    {
+        // The form is only on the employee portal, and so is the rule: a request
+        // raised by HR would lose the record of who actually asked for it.
+        $this->actingAs($this->hr)->get('/hr/people/loans')->assertOk()->assertDontSee('Request a loan');
+        $this->post('/hr/people/loans', ['employee_id' => $this->employeeId, 'type' => 'loan',
+            'amount' => 5000, 'installment' => 500, 'starts_on' => '2018-01-01', 'reason' => 'On their behalf'])
+            ->assertForbidden();
+
+        // Scoped to this employee: a global count would depend on whatever else
+        // happens to be in the database, demo data included.
+        $this->assertSame(0, DB::table('employee_loans')->where('employee_id', $this->employeeId)->count());
+    }
+
+    public function test_loan_and_overtime_integrate_with_payroll_exactly_once(): void
+    {
+        $overtime = $this->overtime();
+        $supervisor = $this->user('supervisor');
+        $this->assignSupervisor($supervisor);
+        $this->actingAs($supervisor)->post('/employee/people/overtime/'.$overtime, ['action' => 'approve'])->assertRedirect();
+        $final = $this->user('supervisor');
+        config(['leave.supervisor_approver_user_id' => $final->user_id]);
+        $this->actingAs($final)->post('/employee/people/overtime/'.$overtime, ['action' => 'approve', 'approved_amount' => 300])->assertRedirect();
+        $this->actingAs($this->staff)->post('/employee/people/loans', ['type' => 'cash_advance', 'amount' => 1000, 'installment' => 600, 'starts_on' => '2018-01-01', 'reason' => 'Travel expenses'])->assertRedirect();
+        $loan = DB::table('employee_loans')->where('employee_id', $this->employeeId)->value('id');
+        $this->actingAs($this->hr)->post('/hr/people/loans/'.$loan, ['action' => 'approve'])->assertRedirect();
+        $this->post('/hr/people/loans/'.$loan, ['action' => 'disburse'])->assertRedirect();
+        $this->attend($this->employeeId, '2018-01-01', '2018-01-31');
+        $service = app(PayrollRun::class);
+        $payroll = $service->generate($this->employeeId, PayPeriod::fromStart('2018-01-01'));
+        $this->assertDatabaseHas('hr_payroll', ['payroll_id' => $payroll, 'overtime_pay' => 300, 'loan_deduction' => 600]);
+        $this->assertNull($service->generate($this->employeeId, PayPeriod::fromStart('2018-01-01')));
+        $next = $service->generate($this->employeeId, PayPeriod::fromStart('2018-01-16'));
+        $this->assertDatabaseHas('hr_payroll', ['payroll_id' => $next, 'overtime_pay' => 0, 'loan_deduction' => 400]);
+        $this->assertNull(DB::table('loan_installments')->where('loan_id', $loan)->value('paid_at'));
+        DB::table('hr_payroll')->whereIn('payroll_id', [$payroll, $next])->update(['status' => 'approved']);
+        $service->markPaid('2018-01-01');
+        $service->markPaid('2018-01-16');
+        $this->assertDatabaseHas('employee_loans', ['id' => $loan, 'status' => 'repaid']);
+        $this->assertSame(0, $service->markPaid('2018-01-01'));
+        $this->get('/hr/people/loans')->assertOk()->assertSee('Repaid');
+    }
+
+}

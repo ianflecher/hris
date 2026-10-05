@@ -1,0 +1,708 @@
+<?php
+
+use Livewire\Volt\Component;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Rule;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rules;
+use Illuminate\Support\Str;
+use App\Support\PersonName;
+use App\Models\User;
+
+new #[Layout('components.layouts.employee')] class extends Component
+{
+    /*
+     * Openings come from the job_positions table, which HR manages at
+     * /hr/positions. The list below the hero and the position dropdown in the
+     * application form both read this one property, so they cannot drift apart
+     * the way the two hardcoded arrays they replace did.
+     */
+    public function openPositions()
+    {
+        return DB::table('job_positions as p')
+            ->leftJoin('departments as d', 'p.department_id', '=', 'd.department_id')
+            ->where('p.is_open', true)
+            ->select('p.position_id', 'p.title', 'p.employment_type', 'p.description', 'd.department_name')
+            ->orderByDesc('p.created_at')
+            ->get();
+    }
+
+    public array $employmentTypes = [
+        'full_time'  => 'Full-time',
+        'part_time'  => 'Part-time',
+        'contract'   => 'Contract',
+        'internship' => 'Internship',
+    ];
+
+    public $showLogin = true; // Toggle between login and register
+    public $email = '';
+    public $password = '';
+    public $remember = false;
+    
+    // Registration fields. Just enough to create the account and start an
+    // application - everything else (contact details, address, experience)
+    // is asked once, properly, on the applicant's own "My details" form
+    // rather than a second time here.
+    public $first_name = '';
+    public $middle_name = '';
+    public $last_name = '';
+    public $password_confirmation = '';
+    public $position = '';
+    public $resume = null;
+    
+    /*
+     * Arriving from a job row on /careers, with that role in the querystring:
+     * open on the registration form with the position already chosen, rather
+     * than making somebody pick it out of the list a second time.
+     */
+    public function mount()
+    {
+        $wanted = trim((string) request()->query('position', ''));
+
+        if ($wanted === '') {
+            return;
+        }
+
+        $this->showLogin = false;
+        $this->position = $this->openPositions()->contains('title', $wanted) ? $wanted : 'Other';
+    }
+
+    public function toggleForm()
+    {
+        $this->showLogin = !$this->showLogin;
+        $this->reset(['email', 'password', 'first_name', 'middle_name', 'last_name', 'password_confirmation', 'position']);
+        $this->resetErrorBag();
+    }
+
+    /**
+     * users.username is a required, unique column with nothing left on this
+     * form to fill it from - it is not the login credential (that is email)
+     * and was never shown back to the applicant anywhere. Generated here
+     * rather than asked for.
+     */
+    
+    public function login()
+{
+    $this->validate([
+        'email' => ['required', 'string', 'email'],
+        'password' => ['required', 'string'],
+    ]);
+    
+    if (Auth::attempt(['email' => $this->email, 'password' => $this->password], $this->remember)) {
+        $user = Auth::user();
+        
+        // Check if user is an employee (not customer anymore)
+        if ($user->role !== 'employee') { // Changed from 'customer' to 'employee'
+            Auth::logout();
+            $this->addError('email', 'This account is not authorized as an employee.');
+            return;
+        }
+               
+        session()->regenerate();
+        return redirect()->route('applicant.index');
+    }
+    
+    $this->addError('email', 'The provided credentials are incorrect.');
+}
+    
+    public function register()
+{
+    $this->validate([
+        'first_name' => ['required', 'string', 'max:80'],
+        'middle_name' => ['nullable', 'string', 'max:80'],
+        'last_name' => ['required', 'string', 'max:80'],
+        'email' => ['required', 'string', 'email', 'max:150', 'unique:users'],
+        'password' => ['required', 'confirmed', Rules\Password::defaults()],
+        'position' => ['required', 'string', 'max:100'],
+    ]);
+
+    // Create user - role defaults to 'employee' according to your schema
+    $user = User::create([
+        'full_name' => PersonName::full($this->first_name, $this->middle_name, $this->last_name),
+        'first_name' => PersonName::tidy($this->first_name),
+        'middle_name' => PersonName::tidy($this->middle_name) ?: null,
+        'last_name' => PersonName::tidy($this->last_name),
+        // The same rule HR's import uses, so a candidate who is later hired
+        // keeps the login they registered with instead of gaining a second.
+        'username' => PersonName::username($this->first_name, $this->last_name),
+        'email' => $this->email,
+        'password' => Hash::make($this->password),
+        // role will default to 'employee' as per your DB schema
+    ]);
+
+    // Create employee record
+    DB::table('employees')->insert([
+        'user_id' => $user->user_id,
+        'job_title' => $this->position,
+        'hire_date' => now(),
+        'salary' => 0.00, // Default salary
+        'status' => 'inactive', // Default status
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    // Create job application record (optional - for tracking)
+    DB::table('job_applications')->insert([
+        'user_id' => $user->user_id,
+        'position_applied' => $this->position,
+        'years_experience' => '',
+        'status' => 'pending', // Since we're creating employee immediately
+        'application_date' => now(),
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    
+    // Auto login after registration
+    Auth::login($user);
+    
+    session()->flash('success', 'Registration successful! You are now registered as an employee.');
+    return redirect()->route('applicant.index');
+}
+}
+?>
+
+<div class="careers-page">
+    <div class="careers-page__inner">
+        <!-- Hero Section -->
+        <div class="careers-hero">
+            <style>
+                /* This photograph is a bright studio shot, so it takes a light
+                   scrim and dark type. The dark treatment used on the staff
+                   sign-in would fight the picture rather than sit on it. */
+                /* The landing page treatment: one photograph, a navy scrim
+                   weighted towards the type, and everything else on glass. */
+                .careers-page {
+                    position: relative;
+                    isolation: isolate;
+                    min-height: calc(100vh - 64px);
+                    padding: 0 0 64px;
+                    background: #0C1626;
+                }
+
+                .careers-page::before {
+                    content: "";
+                    position: absolute;
+                    inset: 0 0 auto 0;
+                    height: 560px;
+                    z-index: -2;
+                    background-image: url("{{ asset('hero-careers.jpg') }}");
+                    background-size: cover;
+                    background-position: center 35%;
+                }
+
+                .careers-page::after {
+                    content: "";
+                    position: absolute;
+                    inset: 0 0 auto 0;
+                    height: 560px;
+                    z-index: -1;
+                    background: linear-gradient(100deg,
+                            rgba(12, 22, 38, .96) 0%,
+                            rgba(12, 22, 38, .92) 34%,
+                            rgba(12, 22, 38, .72) 58%,
+                            rgba(12, 22, 38, .40) 100%),
+                        linear-gradient(to bottom,
+                            rgba(12, 22, 38, 0) 55%,
+                            rgba(12, 22, 38, 1) 100%);
+                }
+
+                .careers-hero {
+                    padding: 72px 0 56px;
+                }
+
+                .careers-hero__copy { max-width: 34rem; }
+
+                .careers-hero__eyebrow {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: .5rem;
+                    padding: .3125rem .75rem;
+                    border-radius: 999px;
+                    background: rgba(227, 27, 35, .16);
+                    border: 1px solid rgba(227, 27, 35, .38);
+                    color: #FCA5A9;
+                    font-size: .75rem;
+                    font-weight: 600;
+                    letter-spacing: .04em;
+                    text-transform: uppercase;
+                }
+
+                .careers-hero__copy h1 {
+                    margin: 16px 0 12px;
+                    font-family: var(--font-head, "Space Grotesk", system-ui, sans-serif);
+                    font-size: clamp(2rem, 4.4vw, 3rem);
+                    font-weight: 700;
+                    line-height: 1.08;
+                    letter-spacing: -0.025em;
+                    color: #fff;
+                }
+
+                .careers-hero__copy p {
+                    margin: 0;
+                    color: #A9B4C6;
+                    font-size: 1.0625rem;
+                    line-height: 1.6;
+                }
+
+                /* Panels, matching the portal cards on the landing page. */
+                .careers-page .panel {
+                    padding: 26px;
+                    border-radius: 14px;
+                    background: rgba(255, 255, 255, .07);
+                    border: 1px solid rgba(255, 255, 255, .16);
+                    -webkit-backdrop-filter: blur(12px);
+                    backdrop-filter: blur(12px);
+                }
+
+                /* Type and controls restated for a dark panel: the inherited
+                   Tailwind classes all assume a white card. */
+                .careers-page .panel h2 { color: #fff; }
+                .careers-page .panel h3 { color: #fff; }
+                .careers-page .panel label { color: #D6DDE8 !important; }
+                .careers-page .panel p,
+                .careers-page .panel span:not([class*="bg-"]) { color: #C6CFDC; }
+
+                /* Field errors were losing to the rule above - one class less
+                   specific - so every "incorrect credentials" and "already
+                   taken" rendered in the same pale grey as the help text and
+                   read as nothing at all. Light red, because text-red-600 is
+                   too dark to see against this panel. */
+                .careers-page .panel .text-red-600 { color: #FCA5A9; }
+
+                /* And the field itself, so the eye lands on which one. */
+                .careers-page .panel input.is-wrong,
+                .careers-page .panel select.is-wrong {
+                    border-color: rgba(252, 165, 169, .85) !important;
+                    background: rgba(227, 27, 35, .10) !important;
+                }
+
+                .careers-page .panel .form-alert {
+                    display: flex;
+                    gap: .625rem;
+                    padding: .75rem .875rem;
+                    border-radius: 10px;
+                    background: rgba(227, 27, 35, .16);
+                    border: 1px solid rgba(252, 165, 169, .45);
+                }
+
+                .careers-page .panel .form-alert p { color: #FCD5D7; margin: 0; }
+
+                .careers-page .panel input,
+                .careers-page .panel select,
+                .careers-page .panel textarea {
+                    background: rgba(255, 255, 255, .06) !important;
+                    border-color: rgba(255, 255, 255, .22) !important;
+                    color: #fff !important;
+                }
+
+                .careers-page .panel input::placeholder,
+                .careers-page .panel textarea::placeholder { color: #8795A8 !important; }
+
+                .careers-page .panel input:focus,
+                .careers-page .panel select:focus,
+                .careers-page .panel textarea:focus {
+                    background: rgba(255, 255, 255, .10) !important;
+                    border-color: #E31B23 !important;
+                    box-shadow: 0 0 0 3px rgba(227, 27, 35, .25) !important;
+                }
+
+                .careers-page .panel select option { background: #0C1626; color: #fff; }
+
+                /* The listed openings sit on the panel, so their own borders
+                   have to come up off white too. */
+                .careers-page .panel .border-gray-200 { border-color: rgba(255, 255, 255, .16) !important; }
+
+                .careers-page__inner {
+                    width: 100%;
+                    max-width: 72rem;
+                    margin: 0 auto;
+                    padding: 0 32px;
+                }
+
+                .careers-page__footnote { color: #7E8CA0; }
+
+                @media (max-width: 860px) {
+                    /* Narrow screens put the type over the middle of the frame,
+                       where a left-weighted scrim leaves it unreadable. */
+                    .careers-page::after {
+                        background: linear-gradient(180deg,
+                            rgba(12, 22, 38, .94) 0%,
+                            rgba(12, 22, 38, .92) 55%,
+                            rgba(12, 22, 38, 1) 100%);
+                    }
+                    .careers-hero { padding: 48px 0 36px; }
+                    .careers-page__inner { padding: 0 20px; }
+                }
+
+            </style>
+
+            <div class="careers-hero__copy">
+                <span class="careers-hero__eyebrow">Careers</span>
+                <h1>Join our team at <span style="color:#F05A60;">Imprint Customs</span></h1>
+                <p>
+                    Looking for an exciting career opportunity? Apply now to
+                    become part of our growing team.
+                </p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-12">
+            <!-- Left Column: Info Cards -->
+            <div class="space-y-6">
+                <!-- Current Openings -->
+                <div class="panel">
+                    <h2 class="text-2xl font-bold text-gray-900 mb-4">Current Openings</h2>
+                    @php $openings = $this->openPositions(); @endphp
+                    @if (count($openings) === 0)
+                        <p class="text-sm text-gray-600">
+                            No openings are posted right now. Register anyway and we
+                            will keep your application on file.
+                        </p>
+                    @else
+                        <div class="space-y-4">
+                            @foreach ($openings as $position)
+                                <div class="border border-gray-200 rounded-lg p-4 hover:border-blue-300 transition-colors">
+                                    <div class="flex justify-between items-start gap-3">
+                                        <div>
+                                            <h3 class="font-semibold text-gray-900">{{ $position->title }}</h3>
+                                            <p class="text-sm text-gray-600">{{ $position->department_name ?? 'Imprint Customs' }}</p>
+                                            @if ($position->description)
+                                                <p class="text-sm text-gray-500 mt-1">{{ $position->description }}</p>
+                                            @endif
+                                        </div>
+                                        <span class="shrink-0 px-3 py-1 text-xs font-medium bg-amber-100 text-amber-800 rounded-full">
+                                            {{ $employmentTypes[$position->employment_type] ?? $position->employment_type }}
+                                        </span>
+                                    </div>
+                                </div>
+                            @endforeach
+                        </div>
+                    @endif
+                </div>
+
+            </div>
+
+            <!-- Right Column: Auth Form -->
+            <div class="panel">
+                <!-- Form Toggle -->
+                <div class="flex mb-8">
+                    <button wire:click="toggleForm" 
+                            class="flex-1 py-3 text-center font-medium text-lg {{ $showLogin ? 'bg-red-600 text-white rounded-l-lg' : 'bg-gray-100 text-gray-600 rounded-l-lg' }}">
+                        <i class="fas fa-sign-in-alt mr-2"></i>
+                        Login
+                    </button>
+                    <button wire:click="toggleForm" 
+                            class="flex-1 py-3 text-center font-medium text-lg {{ !$showLogin ? 'bg-amber-600 text-white rounded-r-lg' : 'bg-gray-100 text-gray-600 rounded-r-lg' }}">
+                        <i class="fas fa-user-plus mr-2"></i>
+                        Register
+                    </button>
+                </div>
+
+                @if($showLogin)
+                    <!-- Login Form -->
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-900 mb-6">Applicant Login</h2>
+                        
+                        @if(session('success'))
+                            <div class="mb-6 p-4 bg-green-50 border border-green-200 text-green-700 rounded-lg">
+                                <i class="fas fa-check-circle mr-2"></i>
+                                {{ session('success') }}
+                            </div>
+                        @endif
+
+                        <form wire:submit="login" class="space-y-6">
+                            {{-- A wrong password only marked the email field, which put the
+                                 one thing somebody needs to read at the bottom of a group.
+                                 Said once, at the top, where it is looked for. --}}
+                            @if ($errors->any())
+                                <div class="form-alert" role="alert" aria-live="polite">
+                                    <i class="fas fa-circle-exclamation mt-0.5" style="color: #FCA5A9"></i>
+                                    <div>
+                                        @foreach ($errors->all() as $message)
+                                            <p class="text-sm">{{ $message }}</p>
+                                        @endforeach
+                                    </div>
+                                </div>
+                            @endif
+
+                            <!-- Email -->
+                            <div>
+                                <label for="login-email" class="block text-sm font-medium text-gray-700 mb-2">
+                                    Email Address
+                                </label>
+                                <div class="relative">
+                                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                        <i class="fas fa-envelope text-gray-400"></i>
+                                    </div>
+                                    <input wire:model="email"
+                                           id="login-email"
+                                           type="email"
+                                           required
+                                           class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent @error('email') is-wrong @enderror"
+                                           placeholder="you@example.com">
+                                </div>
+                                @error('email')
+                                    <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                @enderror
+                            </div>
+
+                            <!-- Password -->
+                            <div>
+                                <div class="flex justify-between items-center mb-2">
+                                    <label for="login-password" class="block text-sm font-medium text-gray-700">
+                                        Password
+                                    </label>
+                                    <a href="#" class="text-sm text-blue-600 hover:text-blue-700">
+                                        Forgot password?
+                                    </a>
+                                </div>
+                                <div class="relative">
+                                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                        <i class="fas fa-lock text-gray-400"></i>
+                                    </div>
+                                    <input wire:model="password"
+                                           id="login-password"
+                                           type="password"
+                                           required
+                                           class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent @error('email') is-wrong @enderror @error('password') is-wrong @enderror"
+                                           placeholder="••••••••">
+                                </div>
+                                @error('password')
+                                    <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                @enderror
+                            </div>
+
+                            <!-- Submit Button -->
+                            <button type="submit" 
+                                    class="w-full bg-red-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors">
+                                <i class="fas fa-sign-in-alt mr-2"></i>
+                                Sign In
+                            </button>
+                        </form>
+
+                    </div>
+                @else
+                    <!-- Registration Form -->
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-900 mb-6">Create Applicant Account</h2>
+                        
+                        <form wire:submit="register" class="space-y-6">
+                            {{-- Same as the sign-in form: what went wrong, said once, at
+                                 the top, rather than only beside whichever field it
+                                 belongs to. --}}
+                            @if ($errors->any())
+                                <div class="form-alert" role="alert" aria-live="polite">
+                                    <i class="fas fa-circle-exclamation mt-0.5" style="color: #FCA5A9"></i>
+                                    <div>
+                                        @foreach ($errors->all() as $message)
+                                            <p class="text-sm">{{ $message }}</p>
+                                        @endforeach
+                                    </div>
+                                </div>
+                            @endif
+
+                            {{-- Deliberately short. Name, where to reach them, what
+                                 they are applying for, a password - everything else
+                                 is asked once on the details form rather than twice. --}}
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                {{-- In parts, the way every form they will
+                                     fill afterwards asks for it. A single box
+                                     could not be sorted by surname and left
+                                     the middle name unrecoverable. --}}
+                                <div>
+                                    <label for="first_name" class="block text-sm font-medium text-gray-700 mb-2">
+                                        First Name *
+                                    </label>
+                                    <div class="relative">
+                                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                            <i class="fas fa-user text-gray-400"></i>
+                                        </div>
+                                        <input wire:model="first_name" id="first_name" type="text" required maxlength="80"
+                                               class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                               placeholder="Juan">
+                                    </div>
+                                    @error('first_name')
+                                        <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                    @enderror
+                                </div>
+
+                                <div>
+                                    <label for="middle_name" class="block text-sm font-medium text-gray-700 mb-2">
+                                        Middle Name
+                                    </label>
+                                    <input wire:model="middle_name" id="middle_name" type="text" maxlength="80"
+                                           class="w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                           placeholder="Optional">
+                                    @error('middle_name')
+                                        <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                    @enderror
+                                </div>
+
+                                <div>
+                                    <label for="last_name" class="block text-sm font-medium text-gray-700 mb-2">
+                                        Last Name *
+                                    </label>
+                                    <input wire:model="last_name" id="last_name" type="text" required maxlength="80"
+                                           class="w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                           placeholder="Dela Cruz">
+                                    @error('last_name')
+                                        <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                    @enderror
+                                </div>
+
+                                <!-- Email: this is what they sign in with. -->
+                                <div>
+                                    <label for="register-email" class="block text-sm font-medium text-gray-700 mb-2">
+                                        Email Address *
+                                    </label>
+                                    <div class="relative">
+                                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                            <i class="fas fa-envelope text-gray-400"></i>
+                                        </div>
+                                        <input wire:model="email"
+                                               id="register-email"
+                                               type="email"
+                                               required
+                                               class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                               placeholder="you@example.com">
+                                    </div>
+                                    @error('email')
+                                        <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                    @enderror
+                                    <p class="mt-1 text-xs text-gray-500">You will sign in with this.</p>
+                                </div>
+                            </div>
+
+                            <!-- Position Applied -->
+                            <div>
+                                <label for="position" class="block text-sm font-medium text-gray-700 mb-2">
+                                    Position Applied For *
+                                </label>
+                                <div class="relative">
+                                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                        <i class="fas fa-briefcase text-gray-400"></i>
+                                    </div>
+                                    <select wire:model="position"
+                                            id="position"
+                                            required
+                                            class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent appearance-none">
+                                        <option value="">Select Position</option>
+                                        {{-- Same source as the openings list above. --}}
+                                        @foreach ($this->openPositions() as $position)
+                                            {{-- Marked selected server-side as well as by wire:model: a
+                                                 role arriving from /careers should already be chosen in the
+                                                 first paint, not once Livewire has booted. --}}
+                                            <option value="{{ $position->title }}" @selected($this->position === $position->title)>{{ $position->title }}</option>
+                                        @endforeach
+                                        <option value="Other" @selected($this->position === 'Other')>Other</option>
+                                    </select>
+                                </div>
+                                @error('position')
+                                    <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                @enderror
+                            </div>
+
+                            <!-- Password -->
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div>
+                                    <label for="register-password" class="block text-sm font-medium text-gray-700 mb-2">
+                                        Password *
+                                    </label>
+                                    <div class="relative">
+                                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                            <i class="fas fa-lock text-gray-400"></i>
+                                        </div>
+                                        <input wire:model="password"
+                                               id="register-password"
+                                               type="password"
+                                               required
+                                               class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                               placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+                                    </div>
+                                    @error('password')
+                                        <p class="mt-1 text-sm text-red-600">{{ $message }}</p>
+                                    @enderror
+                                </div>
+
+                                <!-- Confirm Password -->
+                                <div>
+                                    <label for="password_confirmation" class="block text-sm font-medium text-gray-700 mb-2">
+                                        Confirm Password *
+                                    </label>
+                                    <div class="relative">
+                                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                            <i class="fas fa-lock text-gray-400"></i>
+                                        </div>
+                                        <input wire:model="password_confirmation"
+                                               id="password_confirmation"
+                                               type="password"
+                                               required
+                                               class="w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+                                               placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Terms and Conditions -->
+                            <div class="flex items-start">
+                                <div class="flex items-center h-5">
+                                    <input id="terms" 
+                                           name="terms" 
+                                           type="checkbox" 
+                                           required
+                                           class="h-4 w-4 text-amber-600 focus:ring-amber-500 border-gray-300 rounded">
+                                </div>
+                                <div class="ml-3 text-sm">
+                                    <label for="terms" class="text-gray-700">
+                                        I agree to the 
+                                        <a href="#" class="text-amber-600 hover:text-amber-700">Terms of Service</a> 
+                                        and 
+                                        <a href="#" class="text-amber-600 hover:text-amber-700">Privacy Policy</a>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <!-- Submit Button -->
+                            <button type="submit" 
+                                    class="w-full bg-amber-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 transition-colors">
+                                <i class="fas fa-user-plus mr-2"></i>
+                                Create Account & Apply
+                            </button>
+                        </form>
+
+                        <div class="mt-6 text-center text-sm text-gray-600">
+                            <p>Already have an account? 
+                                <button wire:click="toggleForm" class="text-amber-600 hover:text-amber-700 font-medium">
+                                    Sign in here
+                                </button>
+                            </p>
+                        </div>
+                    </div>
+                @endif
+            </div>
+        </div>
+
+        <!-- Bottom Info -->
+        <div class="mt-12 text-center">
+            {{-- inline-flex with a fixed gap cannot shrink, so these three
+                 items forced ~460px and gave the whole page a horizontal
+                 scrollbar on a phone. Wrapping instead. --}}
+            <div class="careers-page__footnote flex flex-wrap items-center justify-center gap-x-6 gap-y-2">
+                <div class="flex items-center">
+                    <i class="fas fa-shield-alt text-red-600 mr-2"></i>
+                    <span>Secure Application Process</span>
+                </div>
+                <div class="flex items-center">
+                    <i class="fas fa-clock text-red-600 mr-2"></i>
+                    <span>24/7 Application Support</span>
+                </div>
+                <div class="flex items-center">
+                    <i class="fas fa-headset text-red-600 mr-2"></i>
+                    <span>HR Support: hr@imprintcustoms.ph</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
