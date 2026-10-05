@@ -19,6 +19,15 @@ class EnsureAdmin extends Command
 
     public function handle(): int
     {
+        // The demo's made-up staff (…@demo.local) sign in with DEMO_PASSWORD, set
+        // again on every start - a free host restarts and forgets passwords.
+        $demo = (string) env('DEMO_PASSWORD', '');
+        if (strlen($demo) >= 8) {
+            $n = DB::table('users')->where('email', 'like', '%@demo.local')
+                ->update(['password' => \Illuminate\Support\Facades\Hash::make($demo), 'must_change_password' => false]);
+            $this->info("Demo staff password set for {$n} account(s).");
+        }
+
         if (DB::table('users')->where('role', 'admin')->exists()) {
             $this->line('An admin already exists - nothing to do.');
 
